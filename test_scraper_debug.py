@@ -52,3 +52,4 @@ if __name__ == "__main__":
         test_scraper(app_name, headless=False)
         input("Press Enter to continue to next test...")
 
+

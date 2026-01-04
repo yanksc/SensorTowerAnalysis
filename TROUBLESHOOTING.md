@@ -66,3 +66,4 @@ If issues persist:
 3. Try with a different app to see if it's app-specific
 4. Check if SensorTower has updated their Terms of Service regarding scraping
 
+

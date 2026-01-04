@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 import json
 import time
+import re
 from datetime import datetime
 import database
 import scraper
@@ -40,6 +41,71 @@ def format_iap_display(iap_json: str) -> str:
         return "None"
     except:
         return str(iap_json) if iap_json else "None"
+
+
+def convert_text_to_number(text_value):
+    """
+    Convert text values like '8.2K', '134K', '13M', '200k', '< $5k' to plain numbers.
+    
+    Examples:
+    - '8.2K' -> 8200
+    - '134K' -> 134000
+    - '13M' -> 13000000
+    - '200k' -> 200000
+    - '< $5k' -> 0 (less than 5000, so treat as 0)
+    - '< 5k' -> 0 (less than 5000, so treat as 0)
+    - '40K' -> 40000
+    """
+    if pd.isna(text_value) or text_value == '' or text_value is None:
+        return None
+    
+    # Convert to string and strip whitespace
+    text = str(text_value).strip()
+    
+    # Handle empty strings
+    if not text or text.lower() in ['n/a', 'none', '']:
+        return None
+    
+    # Check for "< 5k" or "< $5k" patterns - these mean less than 5000, so return 0
+    if re.match(r'^[<]\s*\$?\s*5\s*[kK]', text, re.IGNORECASE):
+        return 0
+    
+    # Check for "< 5k" in downloads/revenue context
+    if re.match(r'^[<]\s*\$?\s*5', text, re.IGNORECASE):
+        return 0
+    
+    # Remove common prefixes like '< $', '$', etc. (but we already handled < 5k above)
+    text = re.sub(r'^[<>=]?\s*\$?\s*', '', text, flags=re.IGNORECASE)
+    
+    # Extract number and unit
+    # Match patterns like: "8.2K", "134K", "13M", "200k", "5k", etc.
+    match = re.match(r'([\d.]+)\s*([KMBkmb]?)', text, re.IGNORECASE)
+    
+    if not match:
+        # Try to extract just a number if no unit
+        try:
+            return float(text.replace(',', ''))
+        except:
+            return None
+    
+    number_str = match.group(1)
+    unit = match.group(2).upper() if match.group(2) else ''
+    
+    try:
+        number = float(number_str)
+        
+        # Multiply based on unit
+        if unit == 'K':
+            return int(number * 1000)
+        elif unit == 'M':
+            return int(number * 1000000)
+        elif unit == 'B':
+            return int(number * 1000000000)
+        else:
+            # No unit, return as-is
+            return int(number) if number.is_integer() else number
+    except:
+        return None
 
 
 def main():
@@ -90,6 +156,58 @@ def main():
                     if 'in_app_purchases' in export_df.columns:
                         export_df['in_app_purchases'] = export_df['in_app_purchases'].apply(format_iap_display)
                     
+                    # Ensure numeric columns exist (they should already be in the database)
+                    # But convert them if they don't exist for some reason
+                    if 'rating_count_numeric' not in export_df.columns and 'rating_count' in export_df.columns:
+                        export_df['rating_count_numeric'] = export_df['rating_count'].apply(convert_text_to_number)
+                    
+                    if 'downloads_numeric' not in export_df.columns and 'downloads_worldwide' in export_df.columns:
+                        export_df['downloads_numeric'] = export_df['downloads_worldwide'].apply(convert_text_to_number)
+                        # Apply special handling for "5k" downloads
+                        downloads_mask = export_df['downloads_worldwide'].str.strip().str.lower() == '5k'
+                        export_df.loc[downloads_mask, 'downloads_numeric'] = 0
+                    
+                    if 'revenue_numeric' not in export_df.columns and 'revenue_worldwide' in export_df.columns:
+                        export_df['revenue_numeric'] = export_df['revenue_worldwide'].apply(convert_text_to_number)
+                    
+                    if 'average_rating_numeric' not in export_df.columns and 'average_rating' in export_df.columns:
+                        export_df['average_rating_numeric'] = export_df['average_rating'].apply(
+                            lambda x: float(re.sub(r'[^\d.]', '', str(x))) if pd.notna(x) and str(x).strip() else None
+                        )
+                    
+                    # Exclude text-based columns, keep only numeric versions
+                    columns_to_exclude = [
+                        'rating_count',           # Exclude text version
+                        'average_rating',         # Exclude text version
+                        'downloads_worldwide',    # Exclude text version
+                        'revenue_worldwide'       # Exclude text version
+                    ]
+                    
+                    # Select columns to keep (all columns except the text-based ones)
+                    columns_to_keep = [col for col in export_df.columns if col not in columns_to_exclude]
+                    export_df = export_df[columns_to_keep]
+                    
+                    # Rename numeric columns to cleaner names for Excel
+                    column_renames = {
+                        'rating_count_numeric': 'Rating Count',
+                        'average_rating_numeric': 'Average Rating',
+                        'downloads_numeric': 'Downloads',
+                        'revenue_numeric': 'Revenue'
+                    }
+                    export_df = export_df.rename(columns=column_renames)
+                    
+                    # Calculate Revenue / Download (ARPU - Average Revenue Per User)
+                    # Handle division by zero and missing values
+                    if 'Revenue' in export_df.columns and 'Downloads' in export_df.columns:
+                        export_df['Revenue / Download'] = export_df.apply(
+                            lambda row: (
+                                row['Revenue'] / row['Downloads'] 
+                                if pd.notna(row['Revenue']) and pd.notna(row['Downloads']) and row['Downloads'] > 0
+                                else None
+                            ),
+                            axis=1
+                        )
+                    
                     # Generate filename with timestamp
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"sensortower_data_{timestamp}.xlsx"
@@ -97,6 +215,7 @@ def main():
                     # Export to Excel
                     export_df.to_excel(filename, index=False, engine='openpyxl')
                     st.success(f"✅ Exported {len(export_df)} records to {filename}")
+                    st.info("💡 **Tip:** Only numeric columns are included for better Excel calculations and sorting!")
                     
                     # Provide download button
                     with open(filename, 'rb') as f:
@@ -112,9 +231,319 @@ def main():
                 st.error(f"Error exporting data: {e}")
     
     # Main content area
-    tab1, tab2 = st.tabs(["🔍 Search & Scrape", "📊 History"])
+    tab1, tab2 = st.tabs(["📊 Database", "🔍 Search & Scrape"])
     
     with tab1:
+        st.header("📊 Database")
+        
+        # Get history
+        try:
+            history_df = database.get_history()
+            
+            if len(history_df) > 0:
+                # Display statistics
+                col1, col2, col3, col4, col5 = st.columns(5)
+                with col1:
+                    st.metric("Total Apps", len(history_df))
+                with col2:
+                    unique_categories = history_df['categories'].nunique() if 'categories' in history_df.columns else 0
+                    st.metric("Unique Categories", unique_categories)
+                with col3:
+                    free_count = len(history_df[history_df['price'].str.contains('Free', case=False, na=False)]) if 'price' in history_df.columns else 0
+                    st.metric("Free Apps", free_count)
+                with col4:
+                    paid_count = len(history_df[history_df['price'].str.contains('Paid', case=False, na=False)]) if 'price' in history_df.columns else 0
+                    st.metric("Paid Apps", paid_count)
+                with col5:
+                    apps_with_ratings = history_df['average_rating'].notna().sum() if 'average_rating' in history_df.columns else 0
+                    st.metric("Apps with Ratings", apps_with_ratings)
+                
+                st.divider()
+                
+                # Filters
+                st.subheader("🔍 Filters")
+                filter_col1, filter_col2, filter_col3 = st.columns(3)
+                
+                with filter_col1:
+                    category_filter = st.selectbox(
+                        "Filter by Category",
+                        options=["All"] + (history_df['categories'].unique().tolist() if 'categories' in history_df.columns else []),
+                        key="category_filter"
+                    )
+                
+                with filter_col2:
+                    price_filter = st.selectbox(
+                        "Filter by Price",
+                        options=["All", "Free", "Paid"],
+                        key="price_filter"
+                    )
+                
+                with filter_col3:
+                    search_filter = st.text_input(
+                        "Search by Name",
+                        placeholder="Type to filter...",
+                        key="name_filter"
+                    )
+                
+                # Apply filters
+                filtered_df = history_df.copy()
+                
+                if category_filter != "All" and 'categories' in filtered_df.columns:
+                    filtered_df = filtered_df[filtered_df['categories'] == category_filter]
+                
+                if price_filter != "All" and 'price' in filtered_df.columns:
+                    if price_filter == "Free":
+                        filtered_df = filtered_df[filtered_df['price'].str.contains('Free', case=False, na=False)]
+                    elif price_filter == "Paid":
+                        filtered_df = filtered_df[filtered_df['price'].str.contains('Paid', case=False, na=False)]
+                
+                if search_filter and 'app_name' in filtered_df.columns:
+                    filtered_df = filtered_df[filtered_df['app_name'].str.contains(search_filter, case=False, na=False)]
+                
+                st.divider()
+                
+                # Display filtered table with delete options
+                st.subheader(f"📋 Apps ({len(filtered_df)} results)")
+                
+                # Prepare display DataFrame
+                display_df = filtered_df.copy()
+                
+                # Select columns to display (use numeric columns instead of text columns)
+                display_columns = ['app_name', 'app_id', 'categories', 'category_ranking', 'price', 'developer_name', 
+                                 'content_rating', 
+                                 # Use numeric columns instead of text columns
+                                 'average_rating_numeric',  # Instead of 'average_rating'
+                                 'rating_count_numeric',     # Instead of 'rating_count'
+                                 'downloads_numeric',        # Instead of 'downloads_worldwide'
+                                 'revenue_numeric',          # Instead of 'revenue_worldwide'
+                                 'release_date', 'publisher_country', 'last_updated', 'scraped_at']
+                
+                # Only show columns that exist in the DataFrame
+                available_columns = [col for col in display_columns if col in display_df.columns]
+                
+                # Debug: Check if numeric columns exist
+                missing_numeric = [col for col in ['average_rating_numeric', 'rating_count_numeric', 
+                                                   'downloads_numeric', 'revenue_numeric'] 
+                                  if col not in display_df.columns]
+                if missing_numeric and len(filtered_df) > 0:
+                    st.warning(f"⚠️ Some numeric columns are missing: {missing_numeric}. They may not be in the database yet.")
+                
+                # Select only the columns that exist
+                display_df = display_df[available_columns]
+                
+                # Rename numeric columns for cleaner display (remove "_numeric" suffix)
+                column_renames = {}
+                if 'average_rating_numeric' in display_df.columns:
+                    column_renames['average_rating_numeric'] = 'Rating'
+                if 'rating_count_numeric' in display_df.columns:
+                    column_renames['rating_count_numeric'] = 'Rating Count'
+                if 'downloads_numeric' in display_df.columns:
+                    column_renames['downloads_numeric'] = 'Downloads'
+                if 'revenue_numeric' in display_df.columns:
+                    column_renames['revenue_numeric'] = 'Revenue'
+                
+                # Only rename if we have columns to rename
+                if column_renames:
+                    try:
+                        display_df = display_df.rename(columns=column_renames)
+                        # Update available_columns list to reflect renamed columns
+                        for old_name, new_name in column_renames.items():
+                            if old_name in available_columns:
+                                idx = available_columns.index(old_name)
+                                available_columns[idx] = new_name
+                    except Exception as e:
+                        # If rename fails, just continue without renaming
+                        st.warning(f"Could not rename columns: {e}")
+                        pass
+                
+                # Format IAP column if exists
+                if 'in_app_purchases' in filtered_df.columns:
+                    display_df['in_app_purchases'] = filtered_df['in_app_purchases'].apply(format_iap_display)
+                
+                # After renaming, ensure we keep all columns (including renamed ones and IAP)
+                # Don't filter again - display_df already has the correct columns
+                
+                # Ensure numeric columns maintain their numeric type for proper sorting
+                numeric_cols_to_ensure = ['Rating', 'Rating Count', 'Downloads', 'Revenue',
+                                         'rating_count_numeric', 'average_rating_numeric', 
+                                         'downloads_numeric', 'revenue_numeric']
+                
+                for col in numeric_cols_to_ensure:
+                    if col in display_df.columns:
+                        display_df[col] = pd.to_numeric(display_df[col], errors='coerce')
+                
+                # Calculate Revenue / Download (ARPU - Average Revenue Per User)
+                # Handle division by zero and missing values
+                if 'Revenue' in display_df.columns and 'Downloads' in display_df.columns:
+                    display_df['Revenue / Download'] = display_df.apply(
+                        lambda row: (
+                            row['Revenue'] / row['Downloads'] 
+                            if pd.notna(row['Revenue']) and pd.notna(row['Downloads']) and row['Downloads'] > 0
+                            else None
+                        ),
+                        axis=1
+                    )
+                
+                # Display table with column configuration for proper numeric sorting and formatting
+                column_config = {}
+                for col in display_df.columns:
+                    # Format numeric columns with proper number formatting
+                    if col in ['Rating', 'Rating Count', 'Downloads', 'Revenue', 'Revenue / Download']:
+                        if col == 'Rating':
+                            # Rating: show 1 decimal place
+                            column_config[col] = st.column_config.NumberColumn(
+                                col,
+                                format="%.1f"
+                            )
+                        elif col == 'Revenue / Download':
+                            # Revenue per download: show 2 decimal places (currency-like)
+                            column_config[col] = st.column_config.NumberColumn(
+                                col,
+                                format="%.2f"
+                            )
+                        elif col in ['Rating Count', 'Downloads', 'Revenue']:
+                            # Large numbers: format with commas
+                            column_config[col] = st.column_config.NumberColumn(
+                                col,
+                                format="%d"
+                            )
+                
+                # Display table
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    height=400,
+                    hide_index=True,
+                    column_config=column_config if column_config else None
+                )
+                
+                # Quick delete section - show delete buttons for each row
+                if len(filtered_df) > 0:
+                    st.divider()
+                    st.subheader("🗑️ Quick Delete")
+                    st.caption("Select an app to delete quickly")
+                    
+                    # Create a selectbox for quick delete
+                    delete_options = [f"{row.get('app_name', 'Unknown')} (ID: {row.get('app_id', 'N/A')})" 
+                                     for idx, row in filtered_df.iterrows()]
+                    selected_delete = st.selectbox(
+                        "Select app to delete",
+                        options=delete_options,
+                        key="quick_delete_select"
+                    )
+                    
+                    if selected_delete:
+                        # Extract app_id from selection
+                        selected_idx = delete_options.index(selected_delete)
+                        selected_row = filtered_df.iloc[selected_idx]
+                        delete_app_id = selected_row.get('app_id', '')
+                        delete_app_name = selected_row.get('app_name', 'Unknown')
+                        
+                        delete_btn_col1, delete_btn_col2 = st.columns([3, 1])
+                        with delete_btn_col2:
+                            if st.button("🗑️ Delete Selected", type="secondary", use_container_width=True, 
+                                       key=f"quick_delete_{delete_app_id}"):
+                                if delete_app_id:
+                                    success = database.delete_app(delete_app_id)
+                                    if success:
+                                        st.success(f"✅ Deleted '{delete_app_name}' successfully!")
+                                        time.sleep(0.5)
+                                        st.rerun()
+                                    else:
+                                        st.error("❌ Failed to delete app. It may have already been deleted.")
+                                else:
+                                    st.error("❌ Cannot delete: No App ID found.")
+                
+                # Detailed view for selected row
+                st.divider()
+                st.subheader("🔍 Detailed View")
+                
+                if len(filtered_df) > 0:
+                    selected_index = st.selectbox(
+                        "Select an app to view details",
+                        options=range(len(filtered_df)),
+                        format_func=lambda x: filtered_df.iloc[x]['app_name'] if 'app_name' in filtered_df.columns else f"App {x}"
+                    )
+                    
+                    selected_app = filtered_df.iloc[selected_index]
+                    
+                    # Delete button at the top
+                    delete_col1, delete_col2 = st.columns([3, 1])
+                    with delete_col2:
+                        app_id_to_delete = selected_app.get('app_id', '')
+                        app_name_to_delete = selected_app.get('app_name', 'Unknown')
+                        delete_key = f"delete_{app_id_to_delete}_{selected_index}"
+                        
+                        if st.button("🗑️ Delete", type="secondary", use_container_width=True, key=delete_key):
+                            # Confirmation dialog
+                            st.warning(f"⚠️ Are you sure you want to delete '{app_name_to_delete}'?")
+                            confirm_col1, confirm_col2 = st.columns(2)
+                            with confirm_col1:
+                                if st.button("✅ Yes, Delete", key=f"confirm_delete_{delete_key}"):
+                                    if app_id_to_delete:
+                                        success = database.delete_app(app_id_to_delete)
+                                        if success:
+                                            st.success(f"✅ Deleted '{app_name_to_delete}' successfully!")
+                                            time.sleep(0.5)
+                                            st.rerun()
+                                        else:
+                                            st.error("❌ Failed to delete app. Check console for errors.")
+                                    else:
+                                        st.error("❌ Cannot delete: No App ID found.")
+                            with confirm_col2:
+                                if st.button("❌ Cancel", key=f"cancel_delete_{delete_key}"):
+                                    st.rerun()
+                    
+                    detail_col1, detail_col2 = st.columns(2)
+                    
+                    with detail_col1:
+                        st.write("**Basic Information**")
+                        for col in ['app_name', 'app_id', 'categories', 'category_ranking', 'price', 'content_rating', 
+                                   'average_rating', 'rating_count', 'release_date', 'publisher_country', 'last_updated']:
+                            if col in selected_app and selected_app[col]:
+                                display_value = selected_app[col]
+                                # Format category ranking with # prefix if it's a number
+                                if col == 'category_ranking' and display_value and not str(display_value).startswith('#'):
+                                    display_value = f"#{display_value}"
+                                # Format rating display
+                                if col == 'average_rating' and display_value:
+                                    rating_count_val = selected_app.get('rating_count', '')
+                                    if rating_count_val:
+                                        display_value = f"{display_value} ⭐ ({rating_count_val} ratings)"
+                                    else:
+                                        display_value = f"{display_value} ⭐"
+                                elif col == 'rating_count':
+                                    # Skip rating_count as it's shown with average_rating
+                                    continue
+                                st.write(f"- **{col.replace('_', ' ').title()}:** {display_value}")
+                    
+                    with detail_col2:
+                        st.write("**Developer & Metrics**")
+                        for col in ['developer_name', 'developer_website', 'support_url', 
+                                   'downloads_worldwide', 'revenue_worldwide', 'top_countries']:
+                            if col in selected_app:
+                                st.write(f"- **{col.replace('_', ' ').title()}:** {selected_app[col]}")
+                    
+                    # In-App Purchases
+                    if 'in_app_purchases' in selected_app and selected_app['in_app_purchases']:
+                        st.write("**In-App Purchases:**")
+                        try:
+                            iap_data = json.loads(selected_app['in_app_purchases']) if isinstance(selected_app['in_app_purchases'], str) else selected_app['in_app_purchases']
+                            if isinstance(iap_data, list) and len(iap_data) > 0:
+                                iap_df = pd.DataFrame(iap_data)
+                                st.dataframe(iap_df, use_container_width=True)
+                            else:
+                                st.write("None")
+                        except:
+                            st.write(selected_app['in_app_purchases'])
+            else:
+                st.info("📭 No apps scraped yet. Use the 'Search & Scrape' tab to get started!")
+        
+        except Exception as e:
+            st.error(f"❌ Error loading history: {str(e)}")
+            st.exception(e)
+    
+    with tab2:
         st.header("Search for iOS App")
         st.info("💡 **How it works:** Enter an app name, and we'll search the Apple App Store to find the App ID, then scrape data from SensorTower.")
         
@@ -399,6 +828,13 @@ def main():
                                     st.write(f"**Category Ranking:** #{app_data.get('category_ranking', 'N/A')}")
                                 st.write(f"**Price:** {app_data.get('price', 'N/A')}")
                                 st.write(f"**Content Rating:** {app_data.get('content_rating', 'N/A')}")
+                                # Display Apple App Store ratings
+                                avg_rating = app_data.get('average_rating', '')
+                                rating_count = app_data.get('rating_count', '')
+                                if avg_rating or rating_count:
+                                    rating_display = f"{avg_rating} ⭐" if avg_rating else "N/A"
+                                    count_display = f"({rating_count} ratings)" if rating_count else ""
+                                    st.write(f"**App Store Rating:** {rating_display} {count_display}")
                                 st.write(f"**Publisher Country:** {app_data.get('publisher_country', 'N/A')}")
                                 st.write(f"**Last Updated:** {app_data.get('last_updated', 'N/A')}")
                             
@@ -493,217 +929,6 @@ def main():
         
         elif scrape_button and not search_term:
             st.warning("⚠️ Please enter an app name or ID to search.")
-    
-    with tab2:
-        st.header("📊 Scraped Apps History")
-        
-        # Get history
-        try:
-            history_df = database.get_history()
-            
-            if len(history_df) > 0:
-                # Display statistics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Total Apps", len(history_df))
-                with col2:
-                    unique_categories = history_df['categories'].nunique() if 'categories' in history_df.columns else 0
-                    st.metric("Unique Categories", unique_categories)
-                with col3:
-                    free_count = len(history_df[history_df['price'].str.contains('Free', case=False, na=False)]) if 'price' in history_df.columns else 0
-                    st.metric("Free Apps", free_count)
-                with col4:
-                    paid_count = len(history_df[history_df['price'].str.contains('Paid', case=False, na=False)]) if 'price' in history_df.columns else 0
-                    st.metric("Paid Apps", paid_count)
-                
-                st.divider()
-                
-                # Filters
-                st.subheader("🔍 Filters")
-                filter_col1, filter_col2, filter_col3 = st.columns(3)
-                
-                with filter_col1:
-                    category_filter = st.selectbox(
-                        "Filter by Category",
-                        options=["All"] + (history_df['categories'].unique().tolist() if 'categories' in history_df.columns else []),
-                        key="category_filter"
-                    )
-                
-                with filter_col2:
-                    price_filter = st.selectbox(
-                        "Filter by Price",
-                        options=["All", "Free", "Paid"],
-                        key="price_filter"
-                    )
-                
-                with filter_col3:
-                    search_filter = st.text_input(
-                        "Search by Name",
-                        placeholder="Type to filter...",
-                        key="name_filter"
-                    )
-                
-                # Apply filters
-                filtered_df = history_df.copy()
-                
-                if category_filter != "All" and 'categories' in filtered_df.columns:
-                    filtered_df = filtered_df[filtered_df['categories'] == category_filter]
-                
-                if price_filter != "All" and 'price' in filtered_df.columns:
-                    if price_filter == "Free":
-                        filtered_df = filtered_df[filtered_df['price'].str.contains('Free', case=False, na=False)]
-                    elif price_filter == "Paid":
-                        filtered_df = filtered_df[filtered_df['price'].str.contains('Paid', case=False, na=False)]
-                
-                if search_filter and 'app_name' in filtered_df.columns:
-                    filtered_df = filtered_df[filtered_df['app_name'].str.contains(search_filter, case=False, na=False)]
-                
-                st.divider()
-                
-                # Display filtered table with delete options
-                st.subheader(f"📋 Apps ({len(filtered_df)} results)")
-                
-                # Prepare display DataFrame
-                display_df = filtered_df.copy()
-                
-                # Select columns to display
-                display_columns = ['app_name', 'app_id', 'categories', 'category_ranking', 'price', 'developer_name', 
-                                 'content_rating', 'downloads_worldwide', 'revenue_worldwide', 
-                                 'publisher_country', 'last_updated', 'scraped_at']
-                
-                # Only show columns that exist
-                available_columns = [col for col in display_columns if col in display_df.columns]
-                display_df = display_df[available_columns]
-                
-                # Format IAP column if exists
-                if 'in_app_purchases' in filtered_df.columns:
-                    display_df['in_app_purchases'] = filtered_df['in_app_purchases'].apply(format_iap_display)
-                    available_columns.append('in_app_purchases')
-                    display_df = display_df[available_columns]
-                
-                # Display table
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    height=400,
-                    hide_index=True
-                )
-                
-                # Quick delete section - show delete buttons for each row
-                if len(filtered_df) > 0:
-                    st.divider()
-                    st.subheader("🗑️ Quick Delete")
-                    st.caption("Select an app to delete quickly")
-                    
-                    # Create a selectbox for quick delete
-                    delete_options = [f"{row.get('app_name', 'Unknown')} (ID: {row.get('app_id', 'N/A')})" 
-                                     for idx, row in filtered_df.iterrows()]
-                    selected_delete = st.selectbox(
-                        "Select app to delete",
-                        options=delete_options,
-                        key="quick_delete_select"
-                    )
-                    
-                    if selected_delete:
-                        # Extract app_id from selection
-                        selected_idx = delete_options.index(selected_delete)
-                        selected_row = filtered_df.iloc[selected_idx]
-                        delete_app_id = selected_row.get('app_id', '')
-                        delete_app_name = selected_row.get('app_name', 'Unknown')
-                        
-                        delete_btn_col1, delete_btn_col2 = st.columns([3, 1])
-                        with delete_btn_col2:
-                            if st.button("🗑️ Delete Selected", type="secondary", use_container_width=True, 
-                                       key=f"quick_delete_{delete_app_id}"):
-                                if delete_app_id:
-                                    success = database.delete_app(delete_app_id)
-                                    if success:
-                                        st.success(f"✅ Deleted '{delete_app_name}' successfully!")
-                                        time.sleep(0.5)
-                                        st.rerun()
-                                    else:
-                                        st.error("❌ Failed to delete app. It may have already been deleted.")
-                                else:
-                                    st.error("❌ Cannot delete: No App ID found.")
-                
-                # Detailed view for selected row
-                st.divider()
-                st.subheader("🔍 Detailed View")
-                
-                if len(filtered_df) > 0:
-                    selected_index = st.selectbox(
-                        "Select an app to view details",
-                        options=range(len(filtered_df)),
-                        format_func=lambda x: filtered_df.iloc[x]['app_name'] if 'app_name' in filtered_df.columns else f"App {x}"
-                    )
-                    
-                    selected_app = filtered_df.iloc[selected_index]
-                    
-                    # Delete button at the top
-                    delete_col1, delete_col2 = st.columns([3, 1])
-                    with delete_col2:
-                        app_id_to_delete = selected_app.get('app_id', '')
-                        app_name_to_delete = selected_app.get('app_name', 'Unknown')
-                        delete_key = f"delete_{app_id_to_delete}_{selected_index}"
-                        
-                        if st.button("🗑️ Delete", type="secondary", use_container_width=True, key=delete_key):
-                            # Confirmation dialog
-                            st.warning(f"⚠️ Are you sure you want to delete '{app_name_to_delete}'?")
-                            confirm_col1, confirm_col2 = st.columns(2)
-                            with confirm_col1:
-                                if st.button("✅ Yes, Delete", key=f"confirm_delete_{delete_key}"):
-                                    if app_id_to_delete:
-                                        success = database.delete_app(app_id_to_delete)
-                                        if success:
-                                            st.success(f"✅ Deleted '{app_name_to_delete}' successfully!")
-                                            time.sleep(0.5)
-                                            st.rerun()
-                                        else:
-                                            st.error("❌ Failed to delete app. Check console for errors.")
-                                    else:
-                                        st.error("❌ Cannot delete: No App ID found.")
-                            with confirm_col2:
-                                if st.button("❌ Cancel", key=f"cancel_delete_{delete_key}"):
-                                    st.rerun()
-                    
-                    detail_col1, detail_col2 = st.columns(2)
-                    
-                    with detail_col1:
-                        st.write("**Basic Information**")
-                        for col in ['app_name', 'app_id', 'categories', 'category_ranking', 'price', 'content_rating', 
-                                   'publisher_country', 'last_updated']:
-                            if col in selected_app and selected_app[col]:
-                                display_value = selected_app[col]
-                                # Format category ranking with # prefix if it's a number
-                                if col == 'category_ranking' and display_value and not str(display_value).startswith('#'):
-                                    display_value = f"#{display_value}"
-                                st.write(f"- **{col.replace('_', ' ').title()}:** {display_value}")
-                    
-                    with detail_col2:
-                        st.write("**Developer & Metrics**")
-                        for col in ['developer_name', 'developer_website', 'support_url', 
-                                   'downloads_worldwide', 'revenue_worldwide', 'top_countries']:
-                            if col in selected_app:
-                                st.write(f"- **{col.replace('_', ' ').title()}:** {selected_app[col]}")
-                    
-                    # In-App Purchases
-                    if 'in_app_purchases' in selected_app and selected_app['in_app_purchases']:
-                        st.write("**In-App Purchases:**")
-                        try:
-                            iap_data = json.loads(selected_app['in_app_purchases']) if isinstance(selected_app['in_app_purchases'], str) else selected_app['in_app_purchases']
-                            if isinstance(iap_data, list) and len(iap_data) > 0:
-                                iap_df = pd.DataFrame(iap_data)
-                                st.dataframe(iap_df, use_container_width=True)
-                            else:
-                                st.write("None")
-                        except:
-                            st.write(selected_app['in_app_purchases'])
-            else:
-                st.info("📭 No apps scraped yet. Use the 'Search & Scrape' tab to get started!")
-        
-        except Exception as e:
-            st.error(f"❌ Error loading history: {str(e)}")
-            st.exception(e)
 
 
 if __name__ == "__main__":

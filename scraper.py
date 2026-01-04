@@ -14,6 +14,598 @@ from bs4 import BeautifulSoup
 SENSORTOWER_BASE_URL = "https://sensortower.com"
 SENSORTOWER_APP_BASE_URL = "https://app.sensortower.com"
 APPLE_STORE_SEARCH_URL = "https://apps.apple.com/us/iphone/search"
+APPLE_STORE_BASE_URL = "https://apps.apple.com"
+
+
+def scrape_apple_app_store(url: str, headless: bool = True, timeout: int = 30000) -> Dict:
+    """
+    Scrape app data directly from Apple App Store page.
+    
+    Extracts:
+    - Rating count (e.g., "8.1K Ratings")
+    - Average rating (e.g., "4.6")
+    - Age rating (e.g., "Ages 4+")
+    - Category
+    - Developer name
+    - Language
+    - App size
+    - In-app purchases
+    - Price
+    - Description
+    - Release date
+    - Version
+    
+    Args:
+        url: Apple App Store URL (e.g., https://apps.apple.com/us/app/vocal-image-ai-speaking-coach/id1535324205)
+        headless: Whether to run browser in headless mode
+        timeout: Page load timeout in milliseconds
+        
+    Returns:
+        Dictionary containing extracted app data
+    """
+    result = {
+        'app_name': '',
+        'app_id': '',
+        'rating_count': '',
+        'average_rating': '',
+        'age_rating': '',
+        'category': '',
+        'developer_name': '',
+        'languages': '',
+        'app_size': '',
+        'price': '',
+        'in_app_purchases': [],
+        'description': '',
+        'release_date': '',
+        'version': '',
+        'compatibility': '',
+        'copyright': '',
+        'support_url': '',
+        'developer_website': ''
+    }
+    
+    browser = None
+    try:
+        with sync_playwright() as p:
+            # Configure browser launch args
+            launch_args = []
+            if headless:
+                launch_args.extend([
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                ])
+            
+            browser = p.chromium.launch(
+                headless=headless,
+                args=launch_args if launch_args else None
+            )
+            
+            context = browser.new_context(
+                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+                timezone_id='America/New_York',
+                java_script_enabled=True,
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                }
+            )
+            page = context.new_page()
+            page.set_default_timeout(timeout)
+            
+            # Navigate to Apple App Store page
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            time.sleep(3)  # Wait for page to fully load
+            
+            # Wait for main content to load
+            try:
+                page.wait_for_selector('body', state='visible', timeout=10000)
+                time.sleep(2)  # Additional wait for dynamic content
+            except:
+                pass
+            
+            # Get page HTML
+            html_content = page.content()
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract App ID from URL
+            id_match = re.search(r'/id(\d+)', url)
+            if id_match:
+                result['app_id'] = id_match.group(1)
+            
+            # Extract app name from page title or h1
+            try:
+                page_title = page.title()
+                if page_title:
+                    # Format: "App Name - Apple App Store - US - ..."
+                    title_parts = page_title.split(' - ')
+                    if title_parts:
+                        result['app_name'] = title_parts[0].strip()
+            except:
+                pass
+            
+            # Try to get app name from h1
+            if not result['app_name']:
+                try:
+                    h1 = soup.find('h1')
+                    if h1:
+                        result['app_name'] = h1.get_text(strip=True)
+                except:
+                    pass
+            
+            # Extract rating information using JavaScript
+            try:
+                rating_data = page.evaluate("""
+                    () => {
+                        const result = { rating_count: null, average_rating: null };
+                        
+                        // Look for rating text patterns in the entire page
+                        const bodyText = document.body.innerText;
+                        
+                        // More comprehensive patterns
+                        // Pattern 1: "8.1K Ratings 4.6" or "8.1K Ratings\\n4.6"
+                        const pattern1 = /(\\d+\\.?\\d*[KMB]?)\\s*Ratings?[\\s\\n]+(\\d+\\.?\\d*)/i;
+                        const match1 = bodyText.match(pattern1);
+                        if (match1) {
+                            result.rating_count = match1[1];
+                            result.average_rating = match1[2];
+                        }
+                        
+                        // Pattern 2: "4.6 out of 5  8.1K Ratings"
+                        if (!result.rating_count || !result.average_rating) {
+                            const pattern2 = /(\\d+\\.?\\d*)\\s+out of 5[\\s\\n]+(\\d+\\.?\\d*[KMB]?)\\s*Ratings?/i;
+                            const match2 = bodyText.match(pattern2);
+                            if (match2) {
+                                result.average_rating = match2[1];
+                                result.rating_count = match2[2];
+                            }
+                        }
+                        
+                        // Pattern 3: Look for rating and count separately
+                        if (!result.average_rating) {
+                            const ratingMatch = bodyText.match(/(\\d+\\.?\\d*)\\s+out of 5/i);
+                            if (ratingMatch) {
+                                result.average_rating = ratingMatch[1];
+                            }
+                        }
+                        
+                        if (!result.rating_count) {
+                            // Look for rating count with decimal (e.g., "8.1K")
+                            const countMatch = bodyText.match(/(\\d+\\.?\\d*[KMB]?)\\s*Ratings?/i);
+                            if (countMatch) {
+                                result.rating_count = countMatch[1];
+                            }
+                        }
+                        
+                        // Try finding rating elements directly in the DOM
+                        const allElements = document.querySelectorAll('*');
+                        for (const elem of allElements) {
+                            const text = elem.textContent || elem.innerText || '';
+                            if (text.includes('Ratings') || text.includes('out of 5')) {
+                                // Check for rating count with decimal
+                                const countMatch = text.match(/(\\d+\\.?\\d*[KMB]?)\\s*Ratings?/i);
+                                if (countMatch && !result.rating_count) {
+                                    result.rating_count = countMatch[1];
+                                }
+                                
+                                // Check for average rating
+                                const ratingMatch = text.match(/(\\d+\\.?\\d*)\\s+out of 5/i);
+                                if (ratingMatch && !result.average_rating) {
+                                    result.average_rating = ratingMatch[1];
+                                }
+                                
+                                // Also try pattern: "4.6" near "Ratings"
+                                if (!result.average_rating && text.includes('Ratings')) {
+                                    const nearRating = text.match(/(\\d+\\.?\\d*)\\s*[\\s\\n]*Ratings?/i);
+                                    if (nearRating) {
+                                        // Check if there's a number before "Ratings"
+                                        const beforeRatings = text.substring(0, text.indexOf('Ratings'));
+                                        const numMatch = beforeRatings.match(/(\\d+\\.?\\d*)\\s*$/);
+                                        if (numMatch) {
+                                            result.average_rating = numMatch[1];
+                                        }
+                                    }
+                                }
+                                
+                                if (result.average_rating && result.rating_count) {
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        return result;
+                    }
+                """)
+                
+                if rating_data.get('rating_count'):
+                    result['rating_count'] = str(rating_data['rating_count']).strip()
+                if rating_data.get('average_rating'):
+                    result['average_rating'] = str(rating_data['average_rating']).strip()
+            except Exception as e:
+                print(f"Warning: Error extracting ratings via JavaScript: {str(e)}")
+                pass
+            
+            # Fallback: Extract from page text using regex
+            page_text = page.inner_text('body')
+            
+            # Only use fallback if we didn't get both values from JavaScript
+            if not result['rating_count'] or not result['average_rating']:
+                # Pattern: "8.1K Ratings 4.6" or "4.6 out of 5  8.1K Ratings"
+                rating_match = re.search(r'(\d+\.?\d*[KMB]?)\s*Ratings?\s+(\d+\.?\d*)', page_text, re.I)
+                if rating_match:
+                    if not result['rating_count']:
+                        result['rating_count'] = rating_match.group(1).strip()
+                    if not result['average_rating']:
+                        result['average_rating'] = rating_match.group(2).strip()
+                else:
+                    # Try alternative pattern: "4.6 out of 5"
+                    if not result['average_rating']:
+                        rating_alt = re.search(r'(\d+\.?\d*)\s+out of 5', page_text, re.I)
+                        if rating_alt:
+                            result['average_rating'] = rating_alt.group(1).strip()
+                    # Try to find rating count separately
+                    if not result['rating_count']:
+                        count_match = re.search(r'(\d+\.?\d*[KMB]?)\s*Ratings?', page_text, re.I)
+                        if count_match:
+                            result['rating_count'] = count_match.group(1).strip()
+            
+            # Debug: Print what we extracted
+            if result['rating_count'] or result['average_rating']:
+                print(f"Apple Store ratings extracted: {result.get('average_rating', 'N/A')} ⭐ ({result.get('rating_count', 'N/A')} ratings)")
+            else:
+                print(f"Warning: No ratings found on Apple App Store page")
+            
+            # Extract age rating (e.g., "Ages 4+")
+            age_match = re.search(r'Ages\s+(\d+\+)', page_text, re.I)
+            if age_match:
+                result['age_rating'] = age_match.group(1)
+            else:
+                # Try alternative pattern
+                age_alt = re.search(r'(\d+\+)\s+Years?', page_text, re.I)
+                if age_alt:
+                    result['age_rating'] = age_alt.group(1)
+            
+            # Extract category
+            category_match = re.search(r'Category\s+([^\n\r]+)', page_text, re.I)
+            if category_match:
+                result['category'] = category_match.group(1).strip()
+            
+            # Extract developer name
+            dev_match = re.search(r'Developer\s+([^\n\r]+)', page_text, re.I)
+            if dev_match:
+                result['developer_name'] = dev_match.group(1).strip()
+            
+            # Extract language (capture full text including "+ 5 More")
+            # Try JavaScript first for better accuracy
+            try:
+                lang_data = page.evaluate("""
+                    () => {
+                        const bodyText = document.body.innerText;
+                        // Look for "Language" followed by text
+                        const langMatch = bodyText.match(/Language[\\s:]+([^\\n\\r]+?)(?:\\n|Information|Supports|$)/i);
+                        if (langMatch) {
+                            return langMatch[1].trim();
+                        }
+                        return null;
+                    }
+                """)
+                if lang_data:
+                    result['languages'] = lang_data
+            except:
+                pass
+            
+            # Fallback to regex
+            if not result['languages']:
+                lang_match = re.search(r'Language\s+([^\n\r]+?)(?:\n|Information|Supports|$)', page_text, re.I)
+                if lang_match:
+                    lang_text = lang_match.group(1).strip()
+                    # Clean up common patterns
+                    lang_text = re.sub(r'\s+', ' ', lang_text)
+                    result['languages'] = lang_text
+            
+            # Extract app size
+            size_match = re.search(r'Size\s+([^\n\r]+)', page_text, re.I)
+            if size_match:
+                result['app_size'] = size_match.group(1).strip()
+            
+            # Extract price (Free or Paid)
+            if re.search(r'\bFree\b', page_text, re.I):
+                result['price'] = 'Free'
+            else:
+                # Look for price in text
+                price_match = re.search(r'\$(\d+\.?\d*)', page_text)
+                if price_match:
+                    result['price'] = f"${price_match.group(1)}"
+                else:
+                    result['price'] = 'Free'  # Default if no price found
+            
+            # Extract in-app purchases
+            try:
+                iap_section = page.evaluate("""
+                    () => {
+                        const iapItems = [];
+                        const bodyText = document.body.innerText;
+                        const htmlContent = document.body.innerHTML;
+                        
+                        // Look for "In-App Purchases" section
+                        const iapIndex = bodyText.toLowerCase().indexOf('in-app purchases');
+                        if (iapIndex === -1) {
+                            // Try alternative text
+                            const altIndex = bodyText.toLowerCase().indexOf('in‑app purchases');
+                            if (altIndex === -1) return [];
+                            var sectionStart = altIndex;
+                        } else {
+                            var sectionStart = iapIndex;
+                        }
+                        
+                        // Extract larger section to get all IAPs
+                        const section = bodyText.substring(sectionStart, sectionStart + 5000);
+                        
+                        // Look for IAP items - they usually appear as lines with prices
+                        const lines = section.split('\\n');
+                        let inIapSection = false;
+                        
+                        for (let i = 0; i < lines.length; i++) {
+                            const line = lines[i].trim();
+                            
+                            // Check if we're in the IAP section
+                            if (line.toLowerCase().includes('in-app purchase') || 
+                                line.toLowerCase().includes('in‑app purchase')) {
+                                inIapSection = true;
+                                continue;
+                            }
+                            
+                            // Stop if we hit another major section
+                            if (inIapSection && (line.toLowerCase().includes('information') || 
+                                line.toLowerCase().includes('supports') ||
+                                line.toLowerCase().includes('privacy'))) {
+                                break;
+                            }
+                            
+                            if (inIapSection && line) {
+                                // Look for price pattern
+                                const priceMatch = line.match(/\\$([\\d,]+(?:\\.\\d{2})?)/);
+                                if (priceMatch) {
+                                    const price = '$' + priceMatch[1];
+                                    // Get product name (everything before the price)
+                                    const name = line.replace(/\\$[\\d,]+(?:\\.\\d{2})?.*$/, '').trim();
+                                    
+                                    if (name && name.length > 0 && name.length < 200) {
+                                        iapItems.push({
+                                            name: name,
+                                            price: price
+                                        });
+                                    } else {
+                                        iapItems.push({
+                                            name: 'In-App Purchase',
+                                            price: price
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Also try to find IAP in HTML structure
+                        if (iapItems.length === 0) {
+                            // Look for list items or divs containing prices
+                            const priceElements = document.querySelectorAll('*');
+                            for (const elem of priceElements) {
+                                const text = elem.textContent || '';
+                                const priceMatch = text.match(/\\$([\\d,]+(?:\\.\\d{2})?)/);
+                                if (priceMatch && text.toLowerCase().includes('subscription') || 
+                                    text.toLowerCase().includes('purchase')) {
+                                    const price = '$' + priceMatch[1];
+                                    const name = text.replace(/\\$[\\d,]+(?:\\.\\d{2})?.*$/, '').trim();
+                                    if (name && name.length < 200) {
+                                        iapItems.push({ name: name, price: price });
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Remove duplicates
+                        const uniqueIaps = [];
+                        const seen = new Set();
+                        for (const iap of iapItems) {
+                            const key = iap.name + '|' + iap.price;
+                            if (!seen.has(key)) {
+                                seen.add(key);
+                                uniqueIaps.push(iap);
+                            }
+                        }
+                        
+                        return uniqueIaps.slice(0, 20); // Limit to 20 items
+                    }
+                """)
+                
+                if iap_section and len(iap_section) > 0:
+                    result['in_app_purchases'] = iap_section
+            except Exception as e:
+                pass
+            
+            # Extract description (first paragraph)
+            try:
+                # Try multiple strategies to find description
+                desc_text = None
+                
+                # Strategy 1: Look for description in specific elements
+                desc_selectors = [
+                    'div[class*="description"]',
+                    'div[class*="product-review"]',
+                    'div[class*="app-description"]',
+                    'section[class*="description"]',
+                    'p[class*="description"]'
+                ]
+                
+                for selector in desc_selectors:
+                    try:
+                        desc_elem = soup.select_one(selector)
+                        if desc_elem:
+                            desc_text = desc_elem.get_text(strip=True)
+                            if desc_text and len(desc_text) > 50:
+                                break
+                    except:
+                        continue
+                
+                # Strategy 2: Look for text after app name/title
+                if not desc_text or len(desc_text) < 50:
+                    try:
+                        # Find h1 or title, then get next paragraph
+                        h1 = soup.find('h1')
+                        if h1:
+                            next_p = h1.find_next('p')
+                            if next_p:
+                                desc_text = next_p.get_text(strip=True)
+                    except:
+                        pass
+                
+                # Strategy 3: Extract from page text (look for longer paragraphs)
+                if not desc_text or len(desc_text) < 50:
+                    lines = page_text.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if len(line) > 100 and len(line) < 1000:
+                            # Skip if it looks like navigation or metadata
+                            if not any(x in line.lower() for x in ['download', 'app store', 'copyright', 'developer']):
+                                desc_text = line
+                                break
+                
+                if desc_text:
+                    # Clean up and limit length
+                    desc_text = ' '.join(desc_text.split())  # Normalize whitespace
+                    result['description'] = desc_text[:500] + ('...' if len(desc_text) > 500 else '')
+            except:
+                pass
+            
+            # Extract compatibility
+            compat_match = re.search(r'Requires\s+([^\n\r]+)', page_text, re.I)
+            if compat_match:
+                result['compatibility'] = compat_match.group(1).strip()
+            
+            # Extract copyright
+            copyright_match = re.search(r'©\s+([^\n\r]+)', page_text)
+            if copyright_match:
+                result['copyright'] = copyright_match.group(1).strip()
+            
+            # Extract release date / first launch date
+            # Try multiple patterns for release date
+            try:
+                # JavaScript extraction for release date (more reliable)
+                release_js = page.evaluate("""
+                    () => {
+                        const bodyText = document.body.innerText;
+                        // Look for "Released" followed by date in various formats
+                        const patterns = [
+                            /Released[\\s:]+([A-Za-z]+\\s+\\d{1,2},?\\s+\\d{4})/i,
+                            /Release\\s+Date[\\s:]+([A-Za-z]+\\s+\\d{1,2},?\\s+\\d{4})/i,
+                            /First\\s+Available[\\s:]+([A-Za-z]+\\s+\\d{1,2},?\\s+\\d{4})/i,
+                            /Released[\\s:]+(\\d{1,2}[/-]\\d{1,2}[/-]\\d{4})/i,
+                        ];
+                        
+                        for (const pattern of patterns) {
+                            const match = bodyText.match(pattern);
+                            if (match && match[1]) {
+                                return match[1].trim();
+                            }
+                        }
+                        
+                        // Also check HTML for structured data
+                        const metaTags = document.querySelectorAll('meta');
+                        for (const tag of metaTags) {
+                            const property = tag.getAttribute('property') || tag.getAttribute('name') || '';
+                            const content = tag.getAttribute('content') || '';
+                            if ((property.includes('release') || property.includes('date')) && content) {
+                                const dateMatch = content.match(/(\\d{4}[\\/-]\\d{1,2}[\\/-]\\d{1,2}|[A-Za-z]+\\s+\\d{1,2},?\\s+\\d{4})/);
+                                if (dateMatch) {
+                                    return dateMatch[1].trim();
+                                }
+                            }
+                        }
+                        
+                        return null;
+                    }
+                """)
+                if release_js:
+                    result['release_date'] = release_js
+                else:
+                    # Fallback: Pattern matching in page text
+                    # Pattern 1: "Released: Dec 15, 2023" or "Released Dec 15, 2023"
+                    release_match = re.search(r'Released[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})', page_text, re.I)
+                    if release_match:
+                        result['release_date'] = release_match.group(1).strip()
+                    else:
+                        # Pattern 2: Look for date patterns near "Release" or "First" keywords
+                        release_patterns = [
+                            r'(?:First\s+)?Released[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+                            r'(?:First\s+)?Released[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                            r'Release\s+Date[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                            r'First\s+Available[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4})',
+                        ]
+                        for pattern in release_patterns:
+                            match = re.search(pattern, page_text, re.I)
+                            if match:
+                                result['release_date'] = match.group(1).strip()
+                                break
+            except Exception as e:
+                print(f"Warning: Error extracting release date: {str(e)}")
+                pass
+            
+            # Extract version
+            try:
+                # Try JavaScript extraction first
+                version_js = page.evaluate("""
+                    () => {
+                        const bodyText = document.body.innerText;
+                        const match = bodyText.match(/Version[\\s:]+([\\d.]+)/i);
+                        return match ? match[1].trim() : null;
+                    }
+                """)
+                if version_js:
+                    result['version'] = version_js
+                else:
+                    # Fallback: Pattern matching
+                    version_match = re.search(r'Version[:\s]+([\d.]+)', page_text, re.I)
+                    if version_match:
+                        result['version'] = version_match.group(1).strip()
+            except Exception as e:
+                pass
+            
+            # Extract support URL
+            try:
+                support_links = soup.find_all('a', href=re.compile(r'support|help'))
+                if support_links:
+                    href = support_links[0].get('href', '')
+                    if href:
+                        result['support_url'] = href if href.startswith('http') else f"https://apps.apple.com{href}"
+            except:
+                pass
+            
+            # Extract developer website
+            try:
+                dev_links = soup.find_all('a', href=re.compile(r'developer|publisher'))
+                if dev_links:
+                    href = dev_links[0].get('href', '')
+                    if href:
+                        result['developer_website'] = href if href.startswith('http') else f"https://apps.apple.com{href}"
+            except:
+                pass
+            
+            browser.close()
+            return result
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error scraping Apple App Store: {error_msg}")
+        result['error'] = error_msg
+        if browser:
+            try:
+                browser.close()
+            except:
+                pass
+        return result
 
 
 def get_app_id_from_apple(search_term: str, headless: bool = True, timeout: int = 30000) -> Optional[str]:
@@ -167,7 +759,9 @@ def scrape_app_data(search_term: str, headless: bool = True, timeout: int = 6000
         'last_updated': '',
         'publisher_country': '',
         'category_ranking': '',
-        'in_app_purchases': []
+        'in_app_purchases': [],
+        'average_rating': '',
+        'rating_count': ''
     }
     
     browser = None
@@ -1179,6 +1773,42 @@ def scrape_app_data(search_term: str, headless: bool = True, timeout: int = 6000
                     pass
             
             browser.close()
+            
+            # Automatically fetch Apple App Store ratings if we have an app_id
+            # Fetch ratings even if SensorTower scraping had errors (ratings are independent)
+            if result.get('app_id'):
+                try:
+                    apple_url = f"{APPLE_STORE_BASE_URL}/us/app/id{result['app_id']}"
+                    print(f"Fetching Apple App Store ratings from: {apple_url}")
+                    apple_data = scrape_apple_app_store(apple_url, headless=headless, timeout=30000)
+                    
+                    # Always try to add rating data if it exists, regardless of error status
+                    # (Some apps might have ratings even if other data extraction failed)
+                    rating_added = False
+                    if apple_data.get('average_rating'):
+                        result['average_rating'] = apple_data['average_rating']
+                        rating_added = True
+                    if apple_data.get('rating_count'):
+                        result['rating_count'] = apple_data['rating_count']
+                        rating_added = True
+                    
+                    # Add release date if available
+                    if apple_data.get('release_date'):
+                        result['release_date'] = apple_data['release_date']
+                    
+                    if rating_added:
+                        release_info = f" | Released: {apple_data.get('release_date', 'N/A')}" if apple_data.get('release_date') else ""
+                        print(f"✅ Added ratings: {result.get('average_rating', 'N/A')} ⭐ ({result.get('rating_count', 'N/A')} ratings){release_info}")
+                    elif apple_data.get('error'):
+                        print(f"⚠️ Could not fetch Apple Store ratings: {apple_data.get('error', 'Unknown error')}")
+                    else:
+                        print(f"⚠️ No rating data found on Apple App Store page")
+                except Exception as e:
+                    print(f"⚠️ Error fetching Apple Store ratings: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # Don't fail the whole scrape if rating fetch fails
+            
             return result
             
     except Exception as e:

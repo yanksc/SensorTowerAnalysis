@@ -21,3 +21,4 @@ else:
     print("\n❌ FAILED: No app name found")
     print(f"Error: {result.get('error', 'No error message')}")
 
+
